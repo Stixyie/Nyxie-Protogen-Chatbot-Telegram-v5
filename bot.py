@@ -26,10 +26,7 @@ import asyncio
 from duckduckgo_search import DDGS
 import requests
 
-# Load environment variables
-load_dotenv()
-
-# Configure logging with UTF-8 encoding
+# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -40,8 +37,23 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Configure Gemini API
-genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+# Load environment variables
+load_dotenv()
+
+# Configure Gemini API with error handling
+api_key = os.getenv("GEMINI_API_KEY")
+if not api_key:
+    logging.error("GEMINI_API_KEY not found in environment variables")
+    raise ValueError("GEMINI_API_KEY environment variable is required")
+
+try:
+    genai.configure(api_key=api_key)
+    # Test the configuration with a simple generation
+    model = genai.GenerativeModel('gemini-2.0-flash-exp')
+    logging.info("Gemini API configured successfully")
+except Exception as e:
+    logging.error(f"Failed to configure Gemini API: {str(e)}")
+    raise
 
 # Time-aware personality context
 def get_time_aware_personality(current_time, user_lang, timezone_name):
@@ -132,7 +144,7 @@ class UserMemory:
     def __init__(self):
         self.users = {}
         self.memory_dir = "user_memories"
-        self.max_tokens = 1000000
+        self.max_tokens = 2097152
         # Ensure memory directory exists on initialization
         Path(self.memory_dir).mkdir(parents=True, exist_ok=True)
         
@@ -245,108 +257,140 @@ class UserMemory:
         
         return context
 
-def detect_language_intent(message_text):
-    """Detect if user wants to change language from natural language"""
-    message_lower = message_text.lower()
-    language_patterns = {
-        'tr': ['türkçe konuş', 'türkçe olarak konuş', 'türkçeye geç', 'benimle türkçe konuş'],
-        'en': ['speak english', 'talk in english', 'switch to english', 'use english'],
-        'es': ['habla español', 'hablar en español', 'cambiar a español'],
-        'fr': ['parle français', 'parler en français', 'passe en français'],
-        'de': ['sprich deutsch', 'auf deutsch sprechen', 'wechsle zu deutsch'],
-        'it': ['parla italiano', 'parlare in italiano', 'passa all\'italiano'],
-        'pt': ['fale português', 'falar em português', 'mude para português']
-    }
-    
-    for lang, patterns in language_patterns.items():
-        if any(pattern in message_lower for pattern in patterns):
-            return lang
-    return None
+    def trim_context(self, user_id):
+        user_id = str(user_id)
+        if user_id not in self.users:
+            self.load_user_memory(user_id)
+        
+        if self.users[user_id]["messages"]:
+            self.users[user_id]["messages"].pop(0)
+            self.save_user_memory(user_id)
 
-def detect_settings_from_message(message_text):
-    """Detect user preferences from natural language messages"""
-    settings = {}
+async def detect_language_with_gemini(message_text):
+    """
+    Use Gemini to detect the language of the input text
     
-    # Timezone detection
-    timezone_patterns = {
-        'Europe/Istanbul': ['istanbul', 'türkiye', 'ankara', 'izmir'],
-        'America/New_York': ['new york', 'nyc', 'eastern time', 'et'],
-        'Europe/London': ['london', 'uk', 'britain', 'england'],
-        'Asia/Tokyo': ['tokyo', 'japan', 'japanese'],
-        'Europe/Paris': ['paris', 'france', 'french'],
-        'Asia/Dubai': ['dubai', 'uae', 'emirates']
-    }
+    Args:
+        message_text (str): Input text to detect language
     
-    message_lower = message_text.lower()
-    
-    # Check for timezone mentions
-    for tz, patterns in timezone_patterns.items():
-        if any(pattern in message_lower for pattern in patterns):
-            settings['timezone'] = tz
-            break
-    
-    return settings
-
-def add_random_emojis(text, count=2):
-    """Add random positive emojis to text"""
-    positive_emojis = ['✨', '💫', '🌟', '💖', '💝', '💕', '💞', '💓', '💗', '💜', '💙', '💚', '🧡', '❤️', '😊', '🥰', '😍']
-    selected_emojis = random.sample(positive_emojis, min(count, len(positive_emojis)))
-    return f"{' '.join(selected_emojis)} {text} {' '.join(random.sample(positive_emojis, min(count, len(positive_emojis))))}"
-
-# Dynamic multi-language support
-def detect_and_set_user_language(message_text, user_id):
+    Returns:
+        str: Detected language code (2-letter ISO code)
+    """
     try:
-        # Detect language from user's message
-        detected_lang = langdetect.detect(message_text)
-        user_memory.update_user_settings(user_id, {'language': detected_lang})
+        # Prepare the language detection prompt for Gemini
+        language_detection_prompt = f"""
+You are a language detection expert. Your task is to identify the language of the following text precisely.
+
+Text to analyze: ```{message_text}```
+
+Respond ONLY with the 2-letter ISO language code (e.g., 'en', 'tr', 'es', 'fr', 'de', 'ru', 'ar', 'zh', 'ja', 'ko') 
+that best represents the language of the text. 
+
+Rules:
+- If the text is mixed, choose the predominant language
+- Be extremely precise
+- Do not add any additional text or explanation
+- If you cannot confidently determine the language, respond with 'en'
+"""
+        
+        # Use Gemini Pro for language detection
+        model = genai.GenerativeModel('gemini-2.0-flash-exp')
+        response = await model.generate_content_async(language_detection_prompt)
+        
+        # Extract the language code
+        detected_lang = response.text.strip().lower()
+        
+        # Validate and sanitize the language code
+        valid_lang_codes = ['en', 'tr', 'es', 'fr', 'de', 'ru', 'ar', 'zh', 'ja', 'ko', 
+                             'it', 'pt', 'hi', 'nl', 'pl', 'uk', 'sv', 'da', 'fi', 'no']
+        
+        if detected_lang not in valid_lang_codes:
+            logger.warning(f"Invalid language detected: {detected_lang}. Defaulting to English.")
+            return 'en'
+        
+        logger.info(f"Gemini detected language: {detected_lang}")
         return detected_lang
-    except:
-        # If detection fails, get user's existing language or default to 'en'
+    
+    except Exception as e:
+        logger.error(f"Gemini language detection error: {e}")
+        return 'en'
+
+async def detect_and_set_user_language(message_text, user_id):
+    """
+    Detect user language using Gemini and update user settings
+    
+    Args:
+        message_text (str): User's message text
+        user_id (str): Unique user identifier
+    
+    Returns:
+        str: Detected language code
+    """
+    try:
+        # If message is too short, use previous language
+        clean_text = ' '.join(message_text.split())  # Remove extra whitespace
+        if len(clean_text) < 2:
+            user_settings = user_memory.get_user_settings(user_id)
+            return user_settings.get('language', 'en')
+        
+        # Detect language using Gemini
+        detected_lang = await detect_language_with_gemini(message_text)
+        
+        # Update user's language preference
+        user_memory.update_user_settings(user_id, {'language': detected_lang})
+        
+        return detected_lang
+    
+    except Exception as e:
+        logger.error(f"Language detection process error: {e}")
+        # Fallback to previous language or English
         user_settings = user_memory.get_user_settings(user_id)
         return user_settings.get('language', 'en')
 
-def get_analysis_prompt(media_type, caption, lang):
-    """Dynamically generate analysis prompts in the detected language"""
-    if media_type == 'image':
-        prompts = {
-            'tr': "Bu resmi detaylı bir şekilde analiz et ve açıkla.",
-            'en': "Analyze this image in detail and explain what you see.",
-            'es': "Analiza esta imagen en detalle y explica lo que ves.",
-            'fr': "Analysez cette image en détail et expliquez ce que vous voyez.",
-            'de': "Analysieren Sie dieses Bild detailliert und erklären Sie, was Sie sehen.",
-            'ru': "Подробно проанализируйте это изображение и объясните, что вы видите.",
-            'ar': "حلل هذه الصورة بالتفصيل واشرح ما تراه.",
-            'zh': "详细分析这张图片并解释你所看到的内容。"
+def get_error_message(error_type, lang):
+    """Get error message in the appropriate language"""
+    messages = {
+        'ai_error': {
+            'en': "Sorry, I encountered an issue generating a response. Please try again. 🙏",
+            'tr': "Üzgünüm, yanıt oluştururken bir sorun yaşadım. Lütfen tekrar deneyin. 🙏",
+            'es': "Lo siento, tuve un problema al generar una respuesta. Por favor, inténtalo de nuevo. 🙏",
+            'fr': "Désolé, j'ai rencontré un problème lors de la génération d'une réponse. Veuillez réessayer. 🙏",
+            'de': "Entschuldigung, bei der Generierung einer Antwort ist ein Problem aufgetreten. Bitte versuchen Sie es erneut. 🙏",
+            'it': "Mi dispiace, ho riscontrato un problema nella generazione di una risposta. Per favore riprova. 🙏",
+            'pt': "Desculpe, houve um problema ao gerar uma resposta. Você poderia tentar novamente? 🙏",
+            'ru': "Извините, возникла проблема при генерации ответа. Пожалуйста, попробуйте еще раз. 🙏",
+            'ja': "申し訳ありません、応答の生成中に問題が発生しました。もう一度お試しいただけますか？🙏",
+            'ko': "죄송합니다. 응답을 생성하는 데 문제가 발생했습니다. 다시 시도해 주세요. 🙏",
+            'zh': "抱歉，生成回应时出现问题。请重试。🙏"
+        },
+        'unhandled': {
+            'en': "I cannot process this type of message at the moment. 🤔",
+            'tr': "Bu mesaj türünü şu anda işleyemiyorum. 🤔",
+            'es': "No puedo procesar este tipo de mensaje en este momento. 🤔",
+            'fr': "Je ne peux pas traiter ce type de message pour le moment. 🤔",
+            'de': "Ich kann diese Art von Nachricht momentan nicht verarbeiten. 🤔",
+            'it': "Non posso elaborare questo tipo di messaggio al momento. 🤔",
+            'pt': "Não posso processar este tipo de mensagem no momento. 🤔",
+            'ru': "Я не могу обработать этот тип сообщения в данный момент. 🤔",
+            'ja': "現在、このタイプのメッセージを処理できません。🤔",
+            'ko': "현재 이 유형의 메시지를 처리할 수 없습니다. 🤔",
+            'zh': "目前无法处理这种类型的消息。🤔"
+        },
+        'general': {
+            'en': "Sorry, there was a problem processing your message. Could you please try again? 🙏",
+            'tr': "Üzgünüm, mesajını işlerken bir sorun oluştu. Lütfen tekrar dener misin? 🙏",
+            'es': "Lo siento, hubo un problema al procesar tu mensaje. ¿Podrías intentarlo de nuevo? 🙏",
+            'fr': "Désolé, il y a eu un problème lors du traitement de votre message. Pourriez-vous réessayer ? 🙏",
+            'de': "Entschuldigung, bei der Verarbeitung Ihrer Nachricht ist ein Problem aufgetreten. Könnten Sie es bitte noch einmal versuchen? 🙏",
+            'it': "Mi dispiace, c'è stato un problema nell'elaborazione del tuo messaggio. Potresti riprovare? 🙏",
+            'pt': "Desculpe, houve um problema ao processar sua mensagem. Você poderia tentar novamente? 🙏",
+            'ru': "Извините, возникла проблема при обработке вашего сообщения. Не могли бы вы попробовать еще раз? 🙏",
+            'ja': "申し訳ありません、メッセージの処理中に問題が発生しました。もう一度お試しいただけますか？🙏",
+            'ko': "죄송합니다. 메시지 처리 중에 문제가 발생했습니다. 다시 시도해 주시겠습니까? 🙏",
+            'zh': "抱歉，处理您的消息时出现问题。请您重试好吗？🙏"
         }
-    elif media_type == 'video':
-        prompts = {
-            'tr': "Bu videoyu detaylı bir şekilde analiz et ve açıkla.",
-            'en': "Analyze this video in detail and explain what you observe.",
-            'es': "Analiza este video en detalle y explica lo que observas.",
-            'fr': "Analysez cette vidéo en détail et expliquez ce que vous observez.",
-            'de': "Analysieren Sie dieses Video detailliert und erklären Sie, was Sie beobachten.",
-            'ru': "Подробно проанализируйте это видео и объясните, что вы наблюдаете.",
-            'ar': "حلل هذا الفيديو بالتفصيل واشرح ما تلاحظه.",
-            'zh': "详细分析这段视频并解释你所观察到的内容。"
-        }
-    else:
-        prompts = {
-            'tr': "Bu medyayı detaylı bir şekilde analiz et ve açıkla.",
-            'en': "Analyze this media in detail and explain what you see.",
-            'es': "Analiza este medio en detalle y explica lo que ves.",
-            'fr': "Analysez ce média en détail et expliquez ce que vous voyez.",
-            'de': "Analysieren Sie dieses Medium detailliert und erklären Sie, was Sie sehen.",
-            'ru': "Подробно проанализируйте этот носитель и объясните, что вы видите.",
-            'ar': "حلل هذا الوسيط بالتفصيل واشرح ما تراه.",
-            'zh': "详细分析这个媒体并解释你所看到的内容。"
-        }
-    
-    # If caption is provided, use it. Otherwise, use default prompt
-    if caption:
-        return caption
-    
-    # Return prompt in specified language, default to English
-    return prompts.get(lang, prompts['en'])
+    }
+    return messages[error_type].get(lang, messages[error_type]['en'])
 
 async def split_and_send_message(update: Update, text: str, max_length: int = 4096):
     """Uzun mesajları böler ve sırayla gönderir"""
@@ -392,151 +436,159 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(welcome_message)
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Comprehensive logging for debugging
     logger.info("Entering handle_message function")
     
     try:
-        # Validate update object
-        if not update:
-            logger.error("Update object is None")
+        if not update or not update.message:
+            logger.error("Invalid update object or message")
             return
         
-        # Validate message
-        if not update.message:
-            logger.error("Message is None in update object")
-            return
-        
-        # Log message details for debugging
         logger.info(f"Message received: {update.message}")
         logger.info(f"Message text: {update.message.text}")
-        logger.info(f"Message type: {type(update.message)}")
         
         user_id = str(update.effective_user.id)
         logger.info(f"User ID: {user_id}")
         
-        # Get user's current language settings from memory
-        user_settings = user_memory.get_user_settings(user_id)
-        user_lang = user_settings.get('language', 'tr')  # Default to Turkish if not set
-        logger.info(f"User language: {user_lang}")
-        
-        # Check for media types
-        if update.message.photo:
-            logger.info("Photo detected, calling handle_image")
-            await handle_image(update, context)
-            return
-        
-        if update.message.video:
-            logger.info("Video detected, calling handle_video")
-            await handle_video(update, context)
-            return
-        
         # Process text messages
         if update.message.text:
-            # Normalize and strip the message text
             message_text = update.message.text.strip()
             logger.info(f"Processed message text: {message_text}")
             
-            # Language detection and settings
-            detected_lang = detect_language_intent(message_text)
-            if detected_lang:
-                user_memory.update_user_settings(user_id, {'language': detected_lang})
-                logger.info(f"Language updated to: {detected_lang}")
+            # Show typing indicator while processing
+            async def show_typing():
+                while True:
+                    try:
+                        await context.bot.send_chat_action(
+                            chat_id=update.message.chat_id,
+                            action=ChatAction.TYPING
+                        )
+                        await asyncio.sleep(4)  # Refresh typing indicator every 4 seconds
+                    except Exception as e:
+                        logger.error(f"Error in typing indicator: {e}")
+                        break
             
-            # Check for settings changes
-            settings_change = detect_settings_from_message(message_text)
-            if settings_change:
-                user_memory.update_user_settings(user_id, settings_change)
-                logger.info(f"User settings updated: {settings_change}")
+            # Start typing indicator in background
+            typing_task = asyncio.create_task(show_typing())
             
-            # Detect location mentions
-            location = None  # Removed detect_location_from_message function call
-            if location:
-                logger.info(f"Location detected: {location}")
-                # Removed get_weather_data and get_weather_description function calls
-                # await update.message.reply_text(weather_description)
-                return
-            
-            # Prepare context for AI response
             try:
-                # Retrieve relevant conversation context
-                context_messages = user_memory.get_relevant_context(user_id)
+                # Detect language from the current message
+                user_lang = await detect_and_set_user_language(message_text, user_id)
+                logger.info(f"Detected language: {user_lang}")
                 
-                # Prepare personality context
-                personality_context = get_time_aware_personality(
-                    datetime.now(), 
-                    user_lang,
-                    user_settings.get('timezone', 'Europe/Istanbul')
-                )
+                # Get conversation history with token management
+                MAX_RETRIES = 100
+                retry_count = 0
+                context_messages = []
                 
-                # Construct AI prompt
-                ai_prompt = f"""DİKKAT: BU YANITI TAMAMEN TÜRKÇE VERECEKSIN!
-SADECE TÜRKÇE KULLAN! KESİNLİKLE BAŞKA DİL KULLANMA!
-
-{personality_context}
-
-Görevin: Kullanıcının mesajını Türkçe olarak zeki ve samimi bir şekilde yanıtla.
-Rol: Sen Nyxie'sin ve kullanıcıyla Türkçe sohbet ediyorsun.
-
-Yönergeler:
-1. SADECE TÜRKÇE KULLAN
-2. Doğal ve samimi bir dil kullan
-3. Kültürel bağlama uygun ol
-4. Kısa ve öz cevaplar ver
-
-Kullanıcının mesajı: {message_text}"""
-                
-                # Web search
-                try:
-                    logging.info(f"Web search için mesaj: {message_text}")
-                    
-                    # Create Gemini model for web search
-                    model = genai.GenerativeModel('gemini-2.0-flash-exp')
-                    
-                    web_search_response = await intelligent_web_search(message_text, model)
-                    
-                    # Web search yanıtı varsa AI yanıtına ekle
-                    if web_search_response and len(web_search_response.strip()) > 10:
-                        # Güncel AI prompt'una web arama sonuçlarını ekle
-                        ai_prompt += f"\n\nEk Bilgi (Web Arama Sonuçları):\n{web_search_response}"
+                while retry_count < MAX_RETRIES:
+                    try:
+                        context_messages = user_memory.get_relevant_context(user_id)
                         
-                        # Yeniden AI yanıtı oluştur
-                        response = model.generate_content(ai_prompt)
-                        response_text = response.text if hasattr(response, 'text') else response.candidates[0].content.parts[0].text
-                    
-                except Exception as web_search_error:
-                    logging.error(f"Web search hatası: {web_search_error}", exc_info=True)
-                    # Hata durumunda normal yanıta devam et
-                    pass
+                        # Get personality context
+                        personality_context = get_time_aware_personality(
+                            datetime.now(),
+                            user_lang,
+                            user_memory.get_user_settings(user_id).get('timezone', 'Europe/Istanbul')
+                        )
+                        
+                        # Construct AI prompt
+                        ai_prompt = f"""{personality_context}
+
+Task: Respond to the user's message naturally and engagingly in their language.
+Role: You are Nyxie having a conversation with the user.
+
+Previous conversation context:
+{context_messages}
+
+Guidelines:
+1. Respond in the detected language: {user_lang}
+2. Use natural and friendly language
+3. Be culturally appropriate
+4. Keep responses concise
+5. Remember previous context
+
+User's message: {message_text}"""
+                        
+                        # Web search integration
+                        try:
+                            model = genai.GenerativeModel('gemini-2.0-flash-exp')
+                            web_search_response = await intelligent_web_search(message_text, model)
+                            
+                            if web_search_response and len(web_search_response.strip()) > 10:
+                                ai_prompt += f"\n\nAdditional Context (Web Search Results):\n{web_search_response}"
+                            
+                            # Generate AI response
+                            response = await model.generate_content_async(ai_prompt)
+                            response_text = response.text if hasattr(response, 'text') else response.candidates[0].content.parts[0].text
+                            
+                            # Add emojis and send response
+                            response_text = add_emojis_to_text(response_text)
+                            await split_and_send_message(update, response_text)
+                            
+                            # Save successful interaction to memory
+                            user_memory.add_message(user_id, "user", message_text)
+                            user_memory.add_message(user_id, "assistant", response_text)
+                            break  # Exit retry loop on success
+                            
+                        except Exception as search_error:
+                            if "Token limit exceeded" in str(search_error):
+                                # Remove oldest messages and retry
+                                user_memory.trim_context(user_id)
+                                retry_count += 1
+                                logger.warning(f"Token limit exceeded, retrying {retry_count}/{MAX_RETRIES}")
+                                
+                                # Send periodic update about retrying
+                                if retry_count % 10 == 0:
+                                    await update.message.reply_text(f"🔄 Devam eden token yönetimi... ({retry_count} deneme)")
+                                
+                                if retry_count == MAX_RETRIES:
+                                    error_message = get_error_message('token_limit', user_lang)
+                                    await update.message.reply_text(error_message)
+                            else:
+                                raise search_error
+                        
+                    except Exception as context_error:
+                        logger.error(f"Context retrieval error: {context_error}")
+                        retry_count += 1
+                        if retry_count == MAX_RETRIES:
+                            error_message = get_error_message('general', user_lang)
+                            await update.message.reply_text(error_message)
+                            break
                 
-                # Generate AI response
-                model = genai.GenerativeModel('gemini-2.0-flash-exp')
-                response = model.generate_content(ai_prompt)
-                
-                # Extract response text
-                response_text = response.text if hasattr(response, 'text') else response.candidates[0].content.parts[0].text
-                
-                # Add emojis
-                response_text = add_random_emojis(response_text)
-                
-                # Save interaction to memory
-                user_memory.add_message(user_id, "user", message_text)
-                user_memory.add_message(user_id, "assistant", response_text)
-                
-                # Send response
-                await split_and_send_message(update, response_text)
+                if retry_count == MAX_RETRIES:
+                    logger.error("Max retries reached for token management")
+                    error_message = get_error_message('max_retries', user_lang)
+                    await update.message.reply_text(error_message)
             
-            except Exception as ai_error:
-                logger.error(f"AI response generation error: {ai_error}", exc_info=True)
-                error_message = "Üzgünüm, yanıt oluştururken bir sorun yaşadım. Lütfen tekrar deneyin. 🙏"
+            except Exception as e:
+                logger.error(f"Message processing error: {e}")
+                error_message = get_error_message('general', user_lang)
                 await update.message.reply_text(error_message)
+            
+            finally:
+                # Stop typing indicator
+                typing_task.cancel()
         
+        # Handle media messages
+        elif update.message.photo:
+            await handle_image(update, context)
+        elif update.message.video:
+            await handle_video(update, context)
         else:
             logger.warning("Unhandled message type received")
-            await update.message.reply_text("Bu mesaj türünü şu anda işleyemiyorum. 🤔")
+            user_lang = user_memory.get_user_settings(user_id).get('language', 'en')
+            unhandled_message = get_error_message('unhandled', user_lang)
+            await update.message.reply_text(unhandled_message)
     
     except Exception as e:
-        logger.error(f"Mesaj işleme hatası: {e}", exc_info=True)
-        error_message = "Üzgünüm, mesajını işlerken bir sorun oluştu. Lütfen tekrar dener misin? 🙏"
+        logger.error(f"General error: {e}")
+        user_lang = user_memory.get_user_settings(user_id).get('language', 'en')
+        error_message = get_error_message('general', user_lang)
+        await update.message.reply_text(error_message)
+    except SyntaxError as e:
+        logger.error(f"Syntax error: {e}")
+        user_lang = user_memory.get_user_settings(user_id).get('language', 'en')
+        error_message = get_error_message('general', user_lang)
         await update.message.reply_text(error_message)
 
 async def intelligent_web_search(user_message, model):
@@ -555,17 +607,31 @@ async def intelligent_web_search(user_message, model):
         
         # First, generate search queries using Gemini
         query_generation_prompt = f"""
-        Türkçe web arama sorgusu oluştur:
-        - Kullanıcı mesajı: "{user_message}"
-        - En fazla 2 arama sorgusu üret
+        Kullanıcının mesajından en alakalı web araması sorgularını oluştur.
+        
+        Kullanıcı mesajı: {user_message}
+        
+        Kurallar:
+        - En fazla 3 sorgu oluştur
+        - Her sorgu yeni bir satırda olmalı
         - Sorgular net ve spesifik olmalı
         - Türkçe dilinde ve güncel bilgi içermeli
         """
         
-        # Use Gemini to generate search queries
-        logging.info("Gemini ile arama sorgusu oluşturma başlatılıyor")
-        query_response = await model.generate_content_async(query_generation_prompt)
-        logging.info(f"Gemini yanıtı alındı: {query_response.text}")
+        # Use Gemini to generate search queries with timeout and retry logic
+        logging.info("Generating search queries with Gemini")
+        try:
+            query_response = await asyncio.wait_for(
+                model.generate_content_async(query_generation_prompt),
+                timeout=10.0  # 10 second timeout
+            )
+            logging.info(f"Gemini response received: {query_response.text}")
+        except asyncio.TimeoutError:
+            logging.error("Gemini API request timed out")
+            return "Üzgünüm, şu anda arama yapamıyorum. Lütfen daha sonra tekrar deneyin."
+        except Exception as e:
+            logging.error(f"Error generating search queries: {str(e)}")
+            return "Arama sorgularını oluştururken bir hata oluştu."
         
         search_queries = [q.strip() for q in query_response.text.split('\n') if q.strip()]
         
@@ -573,7 +639,7 @@ async def intelligent_web_search(user_message, model):
         if not search_queries:
             search_queries = [user_message]
         
-        logging.info(f"Oluşturulan arama sorguları: {search_queries}")
+        logging.info(f"Generated search queries: {search_queries}")
         
         # Perform web searches
         search_results = []
@@ -782,7 +848,7 @@ Kullanıcının sorusu: {caption}"""
             response_text = response.text if hasattr(response, 'text') else response.candidates[0].content.parts[0].text
             
             # Add culturally appropriate emojis
-            response_text = add_random_emojis(response_text)
+            response_text = add_emojis_to_text(response_text)
             
             # Save the interaction
             user_memory.add_message(user_id, "user", f"[Image] {caption}")
@@ -895,7 +961,7 @@ Kullanıcının sorusu: {caption}"""
             response_text = response.text if hasattr(response, 'text') else response.candidates[0].content.parts[0].text
             
             # Add culturally appropriate emojis
-            response_text = add_random_emojis(response_text)
+            response_text = add_emojis_to_text(response_text)
             
             # Save the interaction
             user_memory.add_message(user_id, "user", f"[Video] {caption}")
@@ -908,20 +974,17 @@ Kullanıcının sorusu: {caption}"""
             logger.error(f"Video processing error: {processing_error}", exc_info=True)
             
             if "Token limit exceeded" in str(processing_error):
-                logger.warning(f"Token limit exceeded for user {user_id}, removing oldest messages")
+                # Remove oldest messages and retry
+                user_memory.trim_context(user_id)
                 try:
-                    if user_memory.users[user_id]["messages"]:
-                        user_memory.users[user_id]["messages"].pop(0)
-                        model = genai.GenerativeModel('gemini-2.0-flash-exp')
-                        response = await model.generate_content_async([
-                            analysis_prompt,
-                            {"mime_type": "video/mp4", "data": video_bytes}
-                        ])
-                        response_text = response.text if hasattr(response, 'text') else response.candidates[0].content.parts[0].text
-                        response_text = add_random_emojis(response_text)
-                        await update.message.reply_text(response_text)
-                    else:
-                        await update.message.reply_text("⚠️ Üzgünüm, videonuzu işlerken hafıza sınırına ulaştım. Lütfen tekrar deneyin.")
+                    model = genai.GenerativeModel('gemini-2.0-flash-exp')
+                    response = await model.generate_content_async([
+                        analysis_prompt,
+                        {"mime_type": "video/mp4", "data": video_bytes}
+                    ])
+                    response_text = response.text if hasattr(response, 'text') else response.candidates[0].content.parts[0].text
+                    response_text = add_emojis_to_text(response_text)
+                    await update.message.reply_text(response_text)
                 except Exception as retry_error:
                     logger.error(f"Retry error: {retry_error}", exc_info=True)
                     await update.message.reply_text("⚠️ Üzgünüm, videonuzu işlerken bir hata oluştu. Lütfen tekrar deneyin.")
@@ -940,6 +1003,81 @@ async def handle_token_limit_error(update: Update):
 async def handle_memory_error(update: Update):
     error_message = "Üzgünüm, bellek sınırına ulaşıldı. Lütfen biraz bekleyip tekrar dener misin? 🙏"
     await update.message.reply_text(error_message)
+
+def add_emojis_to_text(text):
+    """Add random emojis to text using emoji module"""
+    try:
+        # Get all available emojis from the emoji module
+        all_emojis = list(emoji.EMOJI_DATA.keys())
+        
+        # Randomly select 2-4 emojis
+        num_emojis = random.randint(2, 4)
+        selected_emojis = random.sample(all_emojis, num_emojis)
+        
+        # Add emojis at start and end
+        prefix_emojis = ' '.join(random.sample(selected_emojis, num_emojis // 2))
+        suffix_emojis = ' '.join(random.sample(selected_emojis, num_emojis // 2))
+        
+        return f"{prefix_emojis} {text} {suffix_emojis}"
+    except Exception as e:
+        logger.error(f"Error adding emojis: {e}")
+        return text  # Return original text if emoji addition fails
+
+def get_analysis_prompt(media_type, caption, lang):
+    """Dynamically generate analysis prompts in the detected language"""
+    # Define prompts for different media types in multiple languages
+    prompts = {
+        'image': {
+            'tr': "Bu resmi detaylı bir şekilde analiz et ve açıkla. Resimdeki her şeyi dikkatle incele.",
+            'en': "Analyze this image in detail and explain what you see. Carefully examine every aspect of the image.",
+            'es': "Analiza esta imagen en detalle y explica lo que ves. Examina cuidadosamente cada aspecto de la imagen.",
+            'fr': "Analysez cette image en détail et expliquez ce que vous voyez. Examinez attentivement chaque aspect de l'image.",
+            'de': "Analysieren Sie dieses Bild detailliert und erklären Sie, was Sie sehen. Untersuchen Sie jeden Aspekt des Bildes sorgfältig.",
+            'it': "Analizza questa immagine in dettaglio e spiega cosa vedi. Esamina attentamente ogni aspetto dell'immagine.",
+            'pt': "Analise esta imagem em detalhes e explique o que vê. Examine cuidadosamente cada aspecto da imagem.",
+            'ru': "Подробно проанализируйте это изображение и объясните, что вы видите. Тщательно изучите каждый аспект изображения.",
+            'ja': "この画像を詳細に分析し、見たものを説明してください。画像のあらゆる側面を注意深く調べてください。",
+            'ko': "이 이미지를 자세히 분석하고 보이는 것을 설명하세요. 이미지의 모든 측면을 주의 깊게 조사하세요.",
+            'zh': "详细分析这张图片并解释你所看到的内容。仔细检查图片的每个细节。"
+        },
+        'video': {
+            'tr': "Bu videoyu detaylı bir şekilde analiz et ve açıkla. Videodaki her sahneyi ve detayı dikkatle incele.",
+            'en': "Analyze this video in detail and explain what you observe. Carefully examine every scene and detail in the video.",
+            'es': "Analiza este video en detalle y explica lo que observas. Examina cuidadosamente cada escena y detalle del video.",
+            'fr': "Analysez cette vidéo en détail et expliquez ce que vous observez. Examinez attentivement chaque scène et détail de la vidéo.",
+            'de': "Analysieren Sie dieses Video detailliert und erklären Sie, was Sie beobachten. Untersuchen Sie jede Szene und jeden Aspekt des Videos sorgfältig.",
+            'it': "Analizza questo video in dettaglio e spiega cosa osservi. Esamina attentamente ogni scena e dettaglio del video.",
+            'pt': "Analise este vídeo em detalhes e explique o que observa. Examine cuidadosamente cada cena e detalhe do vídeo.",
+            'ru': "Подробно проанализируйте это видео и объясните, что вы наблюдаете. Тщательно изучите каждую сцену и деталь видео.",
+            'ja': "このビデオを詳細に分析し、観察したことを説明してください。ビデオの各シーンと詳細を注意深く調べてください。",
+            'ko': "이 비디오를 자세히 분석하고 관찰한 것을 설명하세요. 비디오의 모든 장면과 세부 사항을 주의 깊게 조사하세요.",
+            'zh': "详细分析这段视频并解释你所观察到的内容。仔细检查视频的每个场景和细节。"
+        },
+        'default': {
+            'tr': "Bu medyayı detaylı bir şekilde analiz et ve açıkla. Her detayı dikkatle incele.",
+            'en': "Analyze this media in detail and explain what you see. Carefully examine every detail.",
+            'es': "Analiza este medio en detalle y explica lo que ves. Examina cuidadosamente cada detalle.",
+            'fr': "Analysez ce média en détail et expliquez ce que vous voyez. Examinez attentivement chaque détail.",
+            'de': "Analysieren Sie dieses Medium detailliert und erklären Sie, was Sie sehen. Untersuchen Sie jeden Aspekt sorgfältig.",
+            'it': "Analizza questo media in dettaglio e spiega cosa vedi. Esamina attentamente ogni dettaglio.",
+            'pt': "Analise este meio em detalhes e explique o que vê. Examine cuidadosamente cada detalhe.",
+            'ru': "Подробно проанализируйте этот носитель и объясните, что вы видите. Тщательно изучите каждый аспект.",
+            'ja': "このメディアを詳細に分析し、見たものを説明してください。すべての詳細を注意深く調べてください。",
+            'ko': "이 미디어를 자세히 분석하고 보이는 것을 설명하세요. 모든 세부 사항을 주의 깊게 조사하세요.",
+            'zh': "详细分析这个媒体并解释你所看到的内容。仔细检查每个细节。"
+        }
+    }
+    
+    # If caption is provided, use it
+    if caption and caption.strip():
+        return caption
+    
+    # Select prompt based on media type and language
+    if media_type in prompts:
+        return prompts[media_type].get(lang, prompts[media_type]['en'])
+    
+    # Fallback to default prompt
+    return prompts['default'].get(lang, prompts['default']['en'])
 
 def main():
     # Initialize bot
