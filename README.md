@@ -42,7 +42,7 @@ Nyxie, sadece bir chatbot değil, aynı zamanda:
 
 ### 4. 🧠 Kullanıcı Hafızası
 - Kullanıcı tercihlerini ve geçmiş etkileşimlerini kaydetme
-- Maksimum 2 milyon token'a kadar konuşma geçmişi
+- Maksimum 1 milyon token'a kadar konuşma geçmişi
 - Her kullanıcı için ayrı JSON hafıza dosyaları
 - Otomatik dil ve zaman dilimi tespiti
 - Güvenli ve şifrelenmiş kullanıcı verileri
