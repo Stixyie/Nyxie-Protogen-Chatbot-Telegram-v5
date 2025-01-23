@@ -1005,22 +1005,36 @@ async def handle_memory_error(update: Update):
     await update.message.reply_text(error_message)
 
 def add_emojis_to_text(text):
-    """Add random emojis to text using emoji module"""
+    """Add context-relevant emojis using Gemini"""
     try:
-        # Get all available emojis from the emoji module
-        all_emojis = list(emoji.EMOJI_DATA.keys())
+        # Use Gemini to suggest relevant emojis
+        emoji_model = genai.GenerativeModel('gemini-2.0-flash-exp')
         
-        # Randomly select 2-4 emojis
-        num_emojis = random.randint(2, 4)
-        selected_emojis = random.sample(all_emojis, num_emojis)
+        # Prompt Gemini to suggest emojis based on text context
+        emoji_prompt = f"""
+        Analyze the following text and suggest the most appropriate and minimal emoji(s) that capture its essence:
         
-        # Add emojis at start and end
-        prefix_emojis = ' '.join(random.sample(selected_emojis, num_emojis // 2))
-        suffix_emojis = ' '.join(random.sample(selected_emojis, num_emojis // 2))
+        Text: "{text}"
         
-        return f"{prefix_emojis} {text} {suffix_emojis}"
+        Guidelines:
+        - Suggest only 0-1 emojis
+        - Choose emojis that truly represent the text's mood or main topic
+        - If no emoji fits, return an empty string
+        
+        Response format: Just the emoji or empty string
+        """
+        
+        emoji_response = emoji_model.generate_content(emoji_prompt)
+        suggested_emoji = emoji_response.text.strip()
+        
+        # If no emoji suggested, return original text
+        if not suggested_emoji:
+            return text
+        
+        # Add emoji at the end
+        return f"{text} {suggested_emoji}"
     except Exception as e:
-        logger.error(f"Error adding emojis: {e}")
+        logger.error(f"Error adding context-relevant emojis: {e}")
         return text  # Return original text if emoji addition fails
 
 def get_analysis_prompt(media_type, caption, lang):
